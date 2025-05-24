@@ -1,0 +1,166 @@
+Below is a **check-list I go through whenever a trading-PPO agent’s curve is flat**.
+I use the line numbers from the two files you uploaded so you can jump straight to the right place.
+
+---
+
+## 1  Sanity-check the raw reward signal
+
+*(`environment.py` - lines 159-189)*
+
+| What to print                                                             | Why it matters                                                                                                                                          |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Mean & std of `reward` per step** for a random policy (e.g. 5000 steps) | If the mean is heavily **negative** or the variance is ≪ 1e-4, the policy gradient will look like pure noise.                                           |
+| **Break-down of fees vs. P\&L**                                           | Your `log_fee ≈ -0.00100` is often larger in magnitude than a 5-min log-return. If the agent keeps switching 0 → 2 → 0 you can drown all positive P\&L. |
+
+```python
+# quick probe
+env = BitcoinTradingEnv(...); rng = np.random.default_rng(0)
+rewards = []
+state,_ = env.reset()
+for _ in range(5000):
+    a = rng.integers(0,3)          # uniform random
+    _, r, d, _ = env.step(int(a))
+    rewards.append(r)
+    if d: state,_ = env.reset()
+print(np.mean(rewards), np.std(rewards))
+```
+
+*If the mean is < −1 e-3 while σ ≈ 1 e-3, learning is very hard.*
+Either lower the fee for debugging or give the agent the *option not to trade* (penalise only **position changes**).
+
+---
+
+++++ May be the reseon lies in the [-1, 0, 1] to [0, 1, 2] change. 
+or, self.log_fee is added twice...
+
+## 2  Verify the critic is really learning
+
+### 2.1  Stored values must be *detached*
+
+In `train_ppo` you append
+
+```python
+buffer.values.append(value.item())     # good – already detached
+```
+
+✅ so the stored prediction will not change later.
+
+### 2.2  Move tensors to the **same device**
+
+If you ever run on GPU, the current code mixes CPU & CUDA:
+
+```python
+batch_returns = returns[batch_indices]          # CPU
+value, ... = actor_critic(...).                 # CUDA
+value_loss = mse(value, batch_returns)          # device mismatch → crash
+```
+
+Either keep everything on CPU or add
+
+```python
+batch_returns    = batch_returns.to(device)
+batch_advantages = batch_advantages.to(device)
+```
+
+just after you slice them (same for `old_log_probs`).
+
+### 2.3  Inspect critic gradients once
+
+After `total_loss.backward()`:
+
+```python
+g = torch.cat([p.grad.flatten() for p in actor_critic.parameters()])
+print('grad L2:', g.norm().item(), '  value_loss:', value_loss.item())
+```
+
+If `grad L2` is 0 or `value_loss` stays e-6 → e-8 for many updates, something blocks learning.
+
+---
+
+## 3  Normalise (or at least centre) the advantages
+
+Large or heavily skewed advantages make the PPO ratio explode and clip at 0.2 most of the time.
+One-liner before you copy them into `batch_advantages`:
+
+```python
+advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+```
+
+---
+
+## 4  Watch the **action distribution**
+
+Add a running log once per epoch:
+
+```python
+with torch.no_grad():
+    dist,_ = actor_critic(batch_market_data, batch_positions)
+print('π(short)=', dist.probs[:,0].mean().item(),
+      'π(flat)=',  dist.probs[:,1].mean().item(),
+      'π(long)=',  dist.probs[:,2].mean().item())
+```
+
+If the probabilities never move away from ≈ \[.33,.33,.33] (or collapse to one class),
+• reward may be too small / noisy, or
+• the gradient is dominated by your imitation KL (β = 0.05). Try β = 0 first.
+
+---
+
+## 5  Scale / clip the rewards before GAE
+
+Even with log-returns, BTC can spike ±0.05 in one bar. Multiplying by the position weight (±1) and adding the fee gives a distribution centred almost at zero but with fat tails. Clipping helps:
+
+```python
+clipped = np.clip(self.rewards, -0.02, 0.02)
+```
+
+or scale:
+
+```python
+self.rewards = [r * 100 for r in self.rewards]   # 1 % → 1.0 instead of 0.01
+```
+
+Remember to undo the scale when you print cumulative return.
+
+---
+
+## 6  Hyper-parameters that matter most
+
+| Parameter     | Your setting | Typical for single-asset                            |
+| ------------- | ------------ | --------------------------------------------------- |
+| `lr`          | 1 e-4        | 3 e-4 (actor) / 1 e-3 (critic)                      |
+| `clip`        | 0.2          | OK                                                  |
+| Mini-batch    | 64           | OK but try full-batch if buffer is small (≤ 2048)   |
+| Entropy bonus | 0.01         | Good; raises exploration                            |
+| Imitation β   | 0.05         | Start at 0, then anneal up: β(t) = 0.05 × (1 − t/T) |
+
+---
+
+## 7  Quick ablation checklist
+
+1. **Turn off imitation loss** → does the RL part alone climb?
+2. **Turn off fees** → does the curve climb?
+3. **Replace CNN with an MLP on flattened window** (to rule out mis-shaped conv input).
+4. **Run one gradient step, then print parameter diff**
+
+   ```python
+   before = actor_critic.state_dict()['actor.0.weight'].clone()
+   …
+   optimizer.step()
+   print(torch.dist(before, actor_critic.state_dict()['actor.0.weight']))
+   ```
+
+   If distance is 0, gradients never reach the head.
+
+---
+
+### Where to start?
+
+1. **Lines 256-258** in `ppo_single_asset.py`: move `batch_returns` to `device`.
+2. **Lines 250-253**: move `batch_advantages` to `device`, then *centre / normalise* them.
+3. Print rewards from `environment.py` line 198 for a random agent; make sure the mean isn’t hugely negative.
+4. Drop `imitation_coef` to 0, rerun for 20 k steps; if learning appears, slowly re-introduce the KL term.
+
+Once those basics work you can fine-tune learning rates and network size, but > 90 % of “flat curve” cases come from the four bullets above.
+
+Good luck—one or two of these probes almost always reveals why the curve is stuck.

@@ -1,6 +1,8 @@
 import gymnasium as gym
 import numpy as np
 import pandas as pd
+import talib as ta
+from tqdm import tqdm
 
 class BitcoinTradingEnv(gym.Env):
     """
@@ -21,13 +23,14 @@ class BitcoinTradingEnv(gym.Env):
     VALID_MODES = ['train', 'val', 'test']
 
     def __init__(self, csv_path, window_size=168, episode_length=1000,
-                 transaction_fee_percent=0.001,
-                 timestamp_col_name='Date', date_ranges_by_mode=None):
+                 transaction_fee_percent=0.0005,
+                 timestamp_col_name='timestamp', date_ranges_by_mode=None):
         super().__init__()
 
         self.window_size = window_size
         self.episode_length = episode_length
         self.transaction_fee_percent = float(transaction_fee_percent)
+        self.timestamp_col_name = timestamp_col_name
         
         try:
             self.df = pd.read_csv(csv_path)
@@ -45,15 +48,15 @@ class BitcoinTradingEnv(gym.Env):
         for col in self.ohlcv_columns:
             assert col in self.df.columns, f"CSV 파일에 '{col}' 컬럼이 없습니다."
 
-        # --- Placeholder: 기술적 지표 생성 ---
-        # TODO:
-        self.ti_column_names = [f'TI{i+1}' for i in range(10)]
-        for ti_col in self.ti_column_names:
-            if ti_col not in self.df.columns:
-                 self.df[ti_col] = np.random.randn(len(self.df)) 
-        # --- 기술적 지표 생성 완료 ---
+        # # --- Placeholder: 기술적 지표 생성 ---
+        # # TODO:
+        # self.ti_column_names = [f'TI{i+1}' for i in range(10)]
+        # for ti_col in self.ti_column_names:
+        #     if ti_col not in self.df.columns:
+        #          self.df[ti_col] = np.random.randn(len(self.df)) 
+        # # --- 기술적 지표 생성 완료 ---
 
-        self.market_feature_columns = self.ohlcv_columns + self.ti_column_names
+        self.market_feature_columns = self.ohlcv_columns + self.generate_technical_indicators()
         
         self.action_space = gym.spaces.Discrete(3) # 0: Short, 1: Neutral, 2: Long
         self.observation_space = gym.spaces.Dict({
@@ -86,8 +89,8 @@ class BitcoinTradingEnv(gym.Env):
             start_date = pd.to_datetime(start_date_str)
             end_date = pd.to_datetime(end_date_str)
             
-            mode_df_slice = self.df[(self.df[self.date_column_name] >= start_date) & \
-                                    (self.df[self.date_column_name] <= end_date)]
+            mode_df_slice = self.df[(self.df[self.timestamp_col_name] >= start_date) & \
+                                    (self.df[self.timestamp_col_name] <= end_date)]
             if mode_df_slice.empty:
                 raise ValueError(f"'{mode_key}' 모드에 대한 데이터가 지정된 날짜 범위 내에 없습니다: {start_date_str} ~ {end_date_str}")
             self.mode_indices[mode_key] = (mode_df_slice.index[0], mode_df_slice.index[-1])
@@ -128,6 +131,7 @@ class BitcoinTradingEnv(gym.Env):
 
         self.current_position = 1 
         self.steps_this_episode = 0
+        self.terminated = False
 
         self.active_mode_start_idx, self.active_mode_end_idx = self.mode_indices[mode]
         
@@ -207,3 +211,138 @@ class BitcoinTradingEnv(gym.Env):
 
     def set_render_mode(self, mode):
         self.render_mode = mode
+
+    def generate_technical_indicators(self):
+        """Generate 10 technical indicators using TA-Lib"""
+        
+        # Get OHLCV data
+        open = self.df['Open'].values
+        high = self.df['High'].values
+        low = self.df['Low'].values
+        close = self.df['Close'].values
+        volume = self.df['Volume'].values
+        
+        # 1. RSI (Relative Strength Index) - Momentum
+        self.df['RSI'] = ta.RSI(close, timeperiod=14)
+        
+        # 2. MACD (Moving Average Convergence Divergence) - Trend
+        macd, macd_signal, _ = ta.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+        self.df['MACD'] = macd - macd_signal  # MACD histogram
+        
+        # 3. Bollinger Bands - Volatility
+        upper, middle, lower = ta.BBANDS(close, timeperiod=20)
+        self.df['BB_Position'] = (close - lower) / (upper - lower)  # Position within BB
+        
+        # 4. ATR (Average True Range) - Volatility
+        self.df['ATR'] = ta.ATR(high, low, close, timeperiod=14)
+        
+        # 5. OBV (On Balance Volume) - Volume
+        self.df['OBV'] = ta.OBV(close, volume)
+        
+        # 6. ADX (Average Directional Index) - Trend Strength
+        self.df['ADX'] = ta.ADX(high, low, close, timeperiod=14)
+        
+        # 7. Stochastic Oscillator - Momentum
+        _, self.df['Stoch_D'] = ta.STOCH(high, low, close, 
+                                        fastk_period=14, slowk_period=3, slowd_period=3)
+        
+        # 8. CCI (Commodity Channel Index) - Momentum/Overbought/Oversold
+        self.df['CCI'] = ta.CCI(high, low, close, timeperiod=20)
+        
+        # 9. MFI (Money Flow Index) - Volume/Momentum
+        self.df['MFI'] = ta.MFI(high, low, close, volume, timeperiod=14)
+        
+        # 10. VWAP (Volume Weighted Average Price) - Volume/Price
+        self.df['VWAP'] = (volume * (high + low + close) / 3).cumsum() / volume.cumsum()
+        
+        # Normalize indicators to similar scales
+        def normalize(series):
+            return (series - series.rolling(window=100, min_periods=1).mean()) / \
+                   (series.rolling(window=100, min_periods=1).std() + 1e-8)
+        
+        indicators = ['RSI', 'MACD', 'BB_Position', 'ATR', 'OBV', 
+                     'ADX', 'Stoch_D', 'CCI', 'MFI', 'VWAP']
+        
+        for ind in indicators:
+            self.df[ind] = normalize(self.df[ind])
+            
+        # Handle NaN values
+        self.df = self.df.fillna(method='bfill').fillna(0)
+
+        return indicators
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    
+    # Test configuration
+    date_ranges = {
+        'train': ('2019-09-01', '2022-12-31'),
+        'val': ('2023-01-01', '2023-06-30'),
+        'test': ('2023-07-01', '2023-12-31')
+    }
+    
+    # Initialize environment
+    env = BitcoinTradingEnv(
+        csv_path="data/BTCUSDT_1h_full_history.csv",
+        window_size=168,
+        episode_length=168,
+        date_ranges_by_mode=date_ranges
+    )
+    
+    # Random policy test
+    rng = np.random.default_rng(42)
+    rewards = []
+    episode_rewards = []
+    current_episode_reward = 0
+    
+    print("Testing random policy...")
+    state, _ = env.reset()
+    
+    for step in tqdm(range(50000)):
+        action = rng.integers(0, 3)  # uniform random
+        _, reward, done, _ = env.step(int(action))
+        rewards.append(reward)
+        current_episode_reward += reward
+        
+        if done:
+            episode_rewards.append(current_episode_reward)
+            current_episode_reward = 0
+            state, _ = env.reset()
+    
+    # Print statistics
+    print("\nRandom Policy Statistics:")
+    print(f"Mean step reward: {np.mean(rewards):.6f}")
+    print(f"Std step reward: {np.std(rewards):.6f}")
+    print(f"Mean episode return: {np.mean(episode_rewards):.6f}")
+    print(f"Std episode return: {np.std(episode_rewards):.6f}")
+    print(f"Mean episode return (exp): {np.exp(np.mean(episode_rewards)):.6f}")
+    
+    # Plot reward distribution
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 2, 1)
+    plt.hist(rewards, bins=50, alpha=0.75)
+    plt.title('Step Reward Distribution')
+    plt.xlabel('Reward')
+    plt.ylabel('Count')
+    
+    plt.subplot(1, 2, 2)
+    plt.hist(episode_rewards, bins=50, alpha=0.75)
+    plt.title('Episode Return Distribution')
+    plt.xlabel('Return')
+    plt.ylabel('Count')
+    
+    plt.tight_layout()
+    plt.savefig('random_policy_rewards.png')
+    plt.close()
+    
+    # Plot cumulative returns
+    plt.figure(figsize=(10, 5))
+    cumulative_returns = np.cumsum(episode_rewards)
+    plt.plot(cumulative_returns)
+    plt.title('Cumulative Returns over Episodes')
+    plt.xlabel('Episode')
+    plt.ylabel('Cumulative Return')
+    plt.grid(True)
+    plt.savefig('random_policy_cumulative.png')
+    plt.close()
