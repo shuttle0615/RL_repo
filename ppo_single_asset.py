@@ -21,6 +21,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from src.environment import BitcoinTradingEnv
 
+torch.set_num_threads(4)        
+torch.set_num_interop_threads(2) 
+
 class ActorCritic(nn.Module):
     def __init__(self, input_shape: Tuple[int, int], n_actions: int):
         super().__init__()
@@ -81,6 +84,241 @@ class ActorCritic(nn.Module):
         
         return dist, value
 
+class PositionalEncoding(nn.Module):
+    """Classic sine–cos positional encodings, fixed (no grads)."""
+    def __init__(self, d_model: int, max_len: int = 512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2) *
+                        -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, D)"""
+        return x + self.pe[: x.size(1)]
+
+class ActorCritic_transformer(nn.Module):
+    def __init__(self, input_shape: Tuple[int, int], n_actions: int,
+                 d_model: int = 64, n_heads: int = 4, n_layers: int = 2):
+        """
+        input_shape: (T, F)  where T = window length (time), F = features.
+        n_actions  : 3 (short / flat / long) by default.
+        """
+        super().__init__()
+        T, F = input_shape                 # time steps, feature dims
+
+        # 1) Linear projection of raw features → d_model
+        self.feat_proj = nn.Linear(F, d_model)
+
+        # 2) Positional encoding + tiny Transformer encoder
+        self.pos_enc = PositionalEncoding(d_model, max_len=T)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model * 4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer,
+                                                 num_layers=n_layers)
+
+        # 3) Attention-pool (learned) over the time dimension
+        self.attn_pool = nn.Linear(d_model, 1)
+
+        # 4) Position embedding (same as before)
+        self.position_embedding = nn.Embedding(3, 32)        # 3 positions
+
+        # 5) Separate torsos for policy / value (upgrade #5)
+        torso_dim = d_model + 32
+        self.policy_torso = nn.Sequential(
+            nn.LayerNorm(torso_dim),
+            nn.Linear(torso_dim, 128), nn.ReLU())
+        self.value_torso = nn.Sequential(
+            nn.LayerNorm(torso_dim),
+            nn.Linear(torso_dim, 128), nn.ReLU())
+
+        # 6) Heads
+        self.actor_head  = nn.Linear(128, n_actions)
+        self.critic_head = nn.Linear(128, 1)
+
+    # ─────────────────────────────────────────────────────────────
+
+    def _transformer_features(self, market: torch.Tensor) -> torch.Tensor:
+        """
+        market: (B, T, F)  →  returns pooled per-batch feature (B, d_model)
+        """
+        x = self.feat_proj(market)          # (B, T, D)
+        x = self.pos_enc(x)
+        x = self.transformer(x)             # (B, T, D)
+
+        # Learned attention pooling
+        w = self.attn_pool(x).softmax(dim=1)   # (B, T, 1)
+        pooled = (x * w).sum(dim=1)           # (B, D)
+        return pooled
+
+    def forward(self,
+                market_data: torch.Tensor,    # (B, T, F)
+                position: torch.Tensor        # (B,) long int
+                ) -> Tuple[Categorical, torch.Tensor]:
+
+        batch_feat = self._transformer_features(market_data)
+        pos_feat   = self.position_embedding(position)
+        combined   = torch.cat([batch_feat, pos_feat], dim=-1)
+
+        # Split torsos so critic can't overwrite policy features
+        pol_latent = self.policy_torso(combined)
+        val_latent = self.value_torso(combined)
+
+        logits = self.actor_head(pol_latent)
+        dist   = Categorical(logits=logits)
+        value  = self.critic_head(val_latent)
+
+        return dist, value
+
+# ---------- 1. Dilated Temporal Convolution Block ------------------------ #
+class TCNBlock(nn.Module):
+    """1-D causal convolution with dilation + residual skip."""
+    def __init__(self, in_ch: int, out_ch: int, kernel: int, dilation: int):
+        super().__init__()
+        pad = (kernel - 1) * dilation        # *causal* left padding
+        self.conv = nn.Conv1d(
+            in_ch, out_ch,
+            kernel_size=kernel, dilation=dilation,
+            padding=pad, bias=False
+        )
+        self.bn   = nn.BatchNorm1d(out_ch)
+        self.act  = nn.ReLU(inplace=True)
+
+        self.downsample = None
+        if in_ch != out_ch:
+            self.downsample = nn.Conv1d(in_ch, out_ch, 1, bias=False)
+
+        nn.init.kaiming_normal_(self.conv.weight, nonlinearity="relu")
+
+    def forward(self, x):
+        y = self.conv(x)
+        y = y[..., :-self.conv.padding[0]]          # strip extra timesteps
+        y = self.act(self.bn(y))
+
+        res = x if self.downsample is None else self.downsample(x)
+        return self.act(y + res)                    # residual sum
+
+
+class DilatedTCN(nn.Module):
+    """3-layer stack with dilations 1,2,4; kernel_size = 3 by default."""
+    def __init__(self, in_ch: int, hidden: int, kernel: int = 3):
+        super().__init__()
+        layers: List[nn.Module] = []
+        ch = in_ch
+        for d in (1, 2, 4):
+            layers.append(TCNBlock(ch, hidden, kernel, dilation=d))
+            ch = hidden
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):               # x: (B, F, T)
+        return self.net(x)              # -> (B, hidden, T)
+# ------------------------------------------------------------------------- #
+
+
+# ---------- 2. Self-Attention over the time axis ------------------------- #
+class TimeAttention(nn.Module):
+    """Multi-head self-attention across the *temporal* dimension."""
+    def __init__(self, dim: int, n_heads: int = 4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=n_heads, batch_first=True
+        )
+
+    def forward(self, h):               # h: (B, T, H)
+        # Allow the model to re-weigh timesteps before pooling
+        out, _ = self.attn(h, h, h)
+        return out
+# ------------------------------------------------------------------------- #
+
+
+# ---------- 3. Actor-Critic --------------------------------------------- #
+class ActorCritic_tcn(nn.Module):
+    """
+    PPO-style actor-critic for *single-asset* trading.
+    Input  : (B, T, F)  – window of market features
+    position: (B,)      – discrete 0=flat,1=long,2=short
+    Output :   dist over n_actions  &  value estimate
+    """
+
+    def __init__(
+        self,
+        input_shape: Tuple[int, int],  # (T, F)
+        n_actions: int,
+        hidden: int = 64,
+        pos_dim: int = 32,
+        attn_heads: int = 4,
+    ):
+        super().__init__()
+        _, feat = input_shape
+
+        # (1) Temporal encoder → (B, H, T)
+        self.tcn = DilatedTCN(in_ch=feat, hidden=hidden)
+
+        # (2) Time-attention → (B, T, H)
+        self.t_attn = TimeAttention(dim=hidden, n_heads=attn_heads)
+
+        # (3) Global representation
+        self.gap = nn.AdaptiveAvgPool1d(1)          # (B, H, 1)
+        self.ln  = nn.LayerNorm(hidden)
+
+        # Position embedding (long / flat / short)
+        self.pos_emb = nn.Embedding(3, pos_dim)
+
+        # Fusion MLP
+        self.fuse = nn.Sequential(
+            nn.Linear(hidden + pos_dim, 128),
+            nn.ReLU(inplace=True)
+        )
+
+        # Actor head
+        self.actor = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(inplace=True),
+            nn.Linear(64, n_actions)
+        )
+
+        # Critic head
+        self.critic = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(inplace=True),
+            nn.Linear(64, 1)
+        )
+
+    # --------------------------- forward ---------------------------------- #
+    def forward(
+        self,
+        market_data: torch.Tensor,   # (B, T, F)
+        position: torch.Tensor      # (B,)
+    ):
+        # step-1  Temporal conv
+        x = market_data.permute(0, 2, 1)           # → (B, F, T)
+        h = self.tcn(x)                            # → (B, H, T)
+
+        # step-2  Attention across time
+        h_t = h.permute(0, 2, 1)                   # (B, T, H)
+        h_t = self.t_attn(h_t)                     # (B, T, H)
+
+        # step-3  Global average pool + norm
+        g = self.gap(h_t.permute(0, 2, 1)).squeeze(-1)   # (B, H)
+        g = self.ln(g)
+
+        # step-4  Position embedding & fusion
+        p = self.pos_emb(position)                 # (B, pos_dim)
+        z = torch.cat([g, p], dim=1)               # (B, H+pos_dim)
+        z = self.fuse(z)                           # (B, 128)
+
+        # Actor
+        logits = self.actor(z)
+        dist   = Categorical(logits=logits)
+
+        # Critic
+        value  = self.critic(z)
+
+        return dist, value
+
+
 class BollingerPolicy:
     """Reference policy using Bollinger Bands strategy"""
     def action_prob(self, state: dict) -> np.ndarray:
@@ -102,6 +340,54 @@ class BollingerPolicy:
             return np.array([0.1, 0.2, 0.7])  # [short, flat, long]
         else:
             return np.array([0.2, 0.6, 0.2])  # [short, flat, long]
+
+class OracleLookaheadPolicy:
+    """
+    *Cheating* baseline that sees `horizon` steps into the future and chooses
+    the action with the highest profit after transaction fees.
+
+    Parameters
+    ----------
+    env : BitcoinTradingEnv
+        The live environment instance (so the policy can read `df` and
+        `current_df_idx`).
+    horizon : int, default=1
+        How many rows ahead to peek. horizon=1 -> look at the next bar only.
+    fee : float, default=0.001
+        One-way fee used to decide whether a tiny change is worth trading.
+    """
+
+    def __init__(self, env, horizon: int = 1, fee: float = 0.001):
+        self.env     = env
+        self.horizon = horizon
+        self.fee     = fee          # fee as decimal (0.1 % → 0.001)
+
+    # ------------------------------------------------------------------ #
+    # interface identical to your BollingerPolicy
+    # ------------------------------------------------------------------ #
+    def action_prob(self, state: dict) -> np.ndarray:
+        """Return a probability vector `[p_short, p_flat, p_long]`."""
+
+        idx_now     = self.env.current_df_idx
+        idx_future  = idx_now + self.horizon
+
+        # If we’re at the very end of the data, fall back to flat.
+        if idx_future > self.env.active_mode_end_idx:
+            return np.array([0.2, 0.6, 0.2], dtype=np.float32)
+
+        price_now    = self.env.df.loc[idx_now,  'Close']
+        price_future = self.env.df.loc[idx_future, 'Close']
+
+        gross_ret    = (price_future - price_now) / price_now   # simple %
+        thr          = self.fee * 2.0                           # fee round-trip
+
+        if   gross_ret >  thr:   # sufficiently large rise
+            return np.array([0.05, 0.05, 0.90], dtype=np.float32)   # go long
+        elif gross_ret < -thr:   # sufficiently large drop
+            return np.array([0.90, 0.05, 0.05], dtype=np.float32)   # go short
+        else:                    # price roughly unchanged → stay flat
+            return np.array([0.20, 0.60, 0.20], dtype=np.float32)
+
 
 class RolloutBuffer:
     def __init__(self):
@@ -146,11 +432,11 @@ def train_ppo(
 ) -> List[float]:
     # Initialize with single optimizer
     actor_critic.to(device)
-    optimizer = optim.Adam(actor_critic.parameters(), lr=1e-4)
+    optimizer = optim.Adam(actor_critic.parameters(), lr=5e-5)
     
     # Loss coefficients
     value_coef = 0.5       # c1 in PPO paper
-    entropy_coef = 0.01    # c2 in PPO paper
+    entropy_coef = 0.005    # c2 in PPO paper
     imitation_coef = beta  # Bollinger imitation weight
     
     # Training loop variables
@@ -219,6 +505,10 @@ def train_ppo(
                 # normalize the advantage
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+                # send to device
+                returns = returns.to(device)
+                advantages = advantages.to(device)
+
                 # Convert buffer data to tensors
                 market_data = torch.FloatTensor(
                     np.array([s["market_data"] for s in buffer.states])
@@ -233,8 +523,8 @@ def train_ppo(
                 for _ in range(10):
                     # Generate mini-batches
                     indices = np.random.permutation(len(buffer.states))
-                    for start_idx in range(0, len(buffer.states), 64):
-                        batch_indices = indices[start_idx:start_idx + 64]
+                    for start_idx in range(0, len(buffer.states), 128):
+                        batch_indices = indices[start_idx:start_idx + 128]
                         
                         # Get batch data
                         batch_market_data = market_data[batch_indices]
@@ -283,16 +573,16 @@ def train_ppo(
                         optimizer.step()
                         
                         # Optional: log different loss components
-                        if step_count % 1000 == 0:
-                            print(f"\nLoss components:")
-                            print(f"Policy loss: {policy_loss.item():.6f}")
-                            print(f"Value loss: {value_loss.item():.6f}")
-                            print(f"Entropy: {entropy.item():.6f}")
-                            print(f"Imitation loss: {imitation_loss.item():.6f}")
-                            print(f"Total loss: {total_loss.item():.6f}")
-                            print('value_loss', value_loss.item(),
-                                    'adv mean', batch_advantages.mean().item(),
-                                    'adv sig',  batch_advantages.std().item())
+                        # if step_count % 1000 == 0:
+                        #     print(f"\nLoss components:")
+                        #     print(f"Policy loss: {policy_loss.item():.6f}")
+                        #     print(f"Value loss: {value_loss.item():.6f}")
+                        #     print(f"Entropy: {entropy.item():.6f}")
+                        #     print(f"Imitation loss: {imitation_loss.item():.6f}")
+                        #     print(f"Total loss: {total_loss.item():.6f}")
+                        #     print('value_loss', value_loss.item(),
+                        #             'adv mean', batch_advantages.mean().item(),
+                        #             'adv sig',  batch_advantages.std().item())
                 
                 buffer.clear()
         
@@ -303,44 +593,58 @@ def train_ppo(
             mean_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
             print(f"\nEpisode {len(episode_rewards)}")
             print(f"Mean reward (last 100): {np.exp(mean_reward):.3f}")
+            print(f"Max reward: {np.exp(max(episode_rewards[-100:])):.3f}")
+            print(f"Min reward: {np.exp(min(episode_rewards[-100:])):.3f}")
+            print("sign", env.flip_sign)
         
+
+        # if abs(np.mean(episode_rewards[-10:])) < 0.0001:
+        #     "reward is 0, change beta"
+        #     imitation_coef = 0.01
+        #     #print(f"Reward has been 0 for 10 episodes, change beta to {imitation_coef}")
+
         # Early stopping check
-        if len(episode_rewards) >= 100:
-            mean_reward = np.mean(episode_rewards[-100:])
+        if len(episode_rewards) >= 10:
+            #breakpoint()
+            mean_reward = np.mean(episode_rewards[-1])
+
             if mean_reward > best_mean_reward:
                 best_mean_reward = mean_reward
-                torch.save(actor_critic.state_dict(), "best_model.pt")
+                torch.save(actor_critic.state_dict(), f"best_model_{np.exp(best_mean_reward):.3f}.pt")
                 print(f"Best mean reward: {best_mean_reward:.3f} - model saved")
                 no_improvement_count = 0
             else:
                 no_improvement_count += 1
                 
-            if no_improvement_count >= 20000:
+            if no_improvement_count >= 400:
                 print(f"Early stopping at step {step_count}")
                 break
     
     pbar.close()
     
-    # Plot training curve
-    plt.figure(figsize=(10, 6))
-    plt.plot(episode_rewards)
-    plt.xlabel('Episode')
-    plt.ylabel('Return')
-    plt.title('Training Performance')
-    plt.grid(True)
-    plt.savefig('training_curve.png')
-    plt.close()
+    # # Plot training curve
+    # plt.figure(figsize=(10, 6))
+    # plt.plot(episode_rewards)
+    # plt.xlabel('Episode')
+    # plt.ylabel('Return')
+    # plt.title('Training Performance')
+    # plt.grid(True)
+    # plt.savefig('training_curve.png')
+    # plt.close()
     
-    return episode_rewards
+    # return episode_rewards
 
 def evaluate(env: BitcoinTradingEnv, actor_critic: ActorCritic, n_episodes: int = 100, mode: str = 'test') -> float:
     device = next(actor_critic.parameters()).device
     rewards = []
+    actions = []
     
     for _ in tqdm(range(n_episodes)):
         state, _ = env.reset(mode=mode)
         episode_reward = 0
         done = False
+        action_list = []
+        reward_list = []
         
         while not done:
             market_data = torch.FloatTensor(state["market_data"]).unsqueeze(0).to(device)
@@ -348,19 +652,21 @@ def evaluate(env: BitcoinTradingEnv, actor_critic: ActorCritic, n_episodes: int 
             
             with torch.no_grad():
                 dist, _ = actor_critic(market_data, position)
-                action = dist.sample()
+                action = dist.logits.argmax(dim=-1) #dist.sample() #dist.logits.argmax(dim=-1) #dist.sample() #
             
-            state, reward, done, _ = env.step(action.item())
+            state, reward, done, _ = env.step(action.item(), mode=mode)
             episode_reward += reward
-            
-        rewards.append(episode_reward)
-    
-    return np.mean(rewards), rewards
+            action_list.append(action.item())
+            reward_list.append(reward)
+        rewards.append((episode_reward, reward_list))
+        actions.append(action_list)
+
+    return np.mean([r[0] for r in rewards]), rewards, actions
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total-steps", type=int, default=2_000_000)
-    parser.add_argument("--beta", type=float, default=0.00)
+    parser.add_argument("--total-steps", type=int, default=4_000_000)
+    parser.add_argument("--beta", type=float, default=0.000)
     parser.add_argument("--data-path", type=str, default="data/BTCUSDT_1h_full_history.csv")
     args = parser.parse_args()
     
@@ -375,7 +681,7 @@ if __name__ == "__main__":
     env = BitcoinTradingEnv(
         csv_path=args.data_path,
         window_size=168,  # 7 days * 24 hours
-        episode_length=168,
+        episode_length=26000,
         date_ranges_by_mode=date_ranges
     )
     
@@ -383,14 +689,57 @@ if __name__ == "__main__":
     input_shape = env.observation_space["market_data"].shape
     n_actions = env.action_space.n
     
-    actor_critic = ActorCritic(input_shape, n_actions)
-    ref_policy = BollingerPolicy()
-    
+    actor_critic = ActorCritic_tcn(input_shape, n_actions)
+    #ref_policy = BollingerPolicy()
+    ref_policy = OracleLookaheadPolicy(env)
+
     # Train
-    #rewards = train_ppo(env, actor_critic, ref_policy, args.total_steps, args.beta)
+    rewards = train_ppo(env, actor_critic, ref_policy, args.total_steps, args.beta)
     
     # Final evaluation
-    actor_critic.load_state_dict(torch.load("best_model.pt"))
-    test_reward, test_rewards = evaluate(env, actor_critic, mode='test')
+    actor_critic.load_state_dict(torch.load("best_model_505.673.pt"))
+    # test_reward, test_rewards = evaluate(env, actor_critic, mode='val')
+    # print(f"\nTest set evaluation mean reward: {np.exp(test_reward):.3f}") 
+    # print(f"Test set rewards: {[np.exp(r) for r in test_rewards]}")
+
+    # evaluate the entire test set 
+    # test_data_ranges = {
+    #     'train': ('2019-09-01', '2022-12-31'),
+    #     'val': ('2023-01-01', '2023-06-30'),
+    #     'test': ('2025-01-01', '2025-04-01')
+    # }
+    # env_test = BitcoinTradingEnv(
+    #     csv_path=args.data_path,
+    #     window_size=168,  # 7 days * 24 hours
+    #     episode_length=2100,
+    #     date_ranges_by_mode=test_data_ranges
+    # )
+    
+    test_data_ranges = {
+        'train': ('2020-01-01', '2022-12-31'),
+        'val': ('2023-01-01', '2023-02-01'),
+        'test': ('2023-03-01', '2025-05-01')
+    }
+    env_test = BitcoinTradingEnv(
+        csv_path=args.data_path,
+        window_size=168,  # 7 days * 24 hours
+        episode_length=18700,
+        date_ranges_by_mode=test_data_ranges
+    )
+    
+
+    test_reward, test_rewards, test_actions = evaluate(env_test, actor_critic, n_episodes=3, mode='test')
     print(f"\nTest set evaluation mean reward: {np.exp(test_reward):.3f}") 
-    print(f"Test set rewards: {[np.exp(r) for r in test_rewards]}")
+    print(f"Test set rewards: {[np.exp(r[0]) for r in test_rewards]}")
+    #print(f"Test set reward changes: {[r[1] for r in test_rewards]}")
+
+    #print(test_actions)
+
+    # action statistics
+    action_stats = {}
+    for action in test_actions[0]:
+        if action not in action_stats:
+            action_stats[action] = 0
+        action_stats[action] += 1
+    print(action_stats)
+    

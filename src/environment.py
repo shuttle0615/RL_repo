@@ -58,6 +58,14 @@ class BitcoinTradingEnv(gym.Env):
 
         self.market_feature_columns = self.ohlcv_columns + self.generate_technical_indicators()
         
+        flip_ti_cols = [        # indicators that change sign if trend is inverted
+        'RSI', 'MACD', 'BB_Position',       # BB_Position 0↔1, but z-score makes sign arbitrary
+        'OBV', 'Stoch_D', 'CCI', 'MFI', 'VWAP'
+        ]
+        no_flip_cols = ['Volume', 'ATR', 'ADX']  # magnitudes only
+        self._flip_idx = [self.market_feature_columns.index(c)
+                  for c in self.ohlcv_columns + flip_ti_cols]
+
         self.action_space = gym.spaces.Discrete(3) # 0: Short, 1: Neutral, 2: Long
         self.observation_space = gym.spaces.Dict({
             "market_data": gym.spaces.Box(
@@ -72,6 +80,7 @@ class BitcoinTradingEnv(gym.Env):
         self.render_mode = 'None'
         self.log_fee = np.log(1 - self.transaction_fee_percent)
         self.terminated = False
+        self.flip_sign = False
 
         self.mode_indices = {}
         if not isinstance(date_ranges_by_mode, dict):
@@ -103,21 +112,41 @@ class BitcoinTradingEnv(gym.Env):
         return self.df.loc[self.current_df_idx, 'Close']
 
     def _get_obs(self):
+        """Return one observation window with per-column z-score normalisation
+        for all technical indicators, while keeping price normalisation
+        (log return to first close) unchanged.
+        """
+        # ----------------  slice the rolling window  -----------------
         start_idx = self.current_df_idx - self.window_size + 1
-        end_idx = self.current_df_idx + 1
+        end_idx   = self.current_df_idx + 1
         df_window = self.df.iloc[start_idx:end_idx].copy()
 
-        first_close_in_window = df_window['Close'].iloc[0]
-        first_volume_in_window = df_window['Volume'].iloc[0]
+        # ----------------  price / volume normalisation --------------
+        first_close  = df_window['Close'].iloc[0]
+        first_volume = df_window['Volume'].iloc[0]
 
         for col in self.ohlcv_columns:
             if col == 'Volume':
-                df_window[col] = np.log((df_window[col] + 1e-7) / (first_volume_in_window + 1e-7))
-            else:
-                df_window[col] = np.log(df_window[col] / (first_close_in_window + 1e-9))
-        
+                df_window[col] = np.log((df_window[col] + 1e-7) /
+                                        (first_volume            + 1e-7))
+            else:  # Open, High, Low, Close
+                df_window[col] = np.log(df_window[col] / (first_close + 1e-9))
+
+        # ----------------  per-indicator z-score ---------------------
+        ti_cols = [c for c in self.market_feature_columns if c not in self.ohlcv_columns]
+        if ti_cols:  # defensive: in case you switch features later
+            mu  = df_window[ti_cols].mean()
+            std = df_window[ti_cols].std().replace(0.0, 1.0)  # avoid 0-div
+            df_window[ti_cols] = (df_window[ti_cols] - mu) / (std + 1e-8)
+
+        # ----------------  assemble numpy array ----------------------
         market_data_obs = df_window[self.market_feature_columns].values.astype(np.float64)
-        
+
+        # ----------------  optional episode-level sign flip ----------
+        if self.flip_sign:
+            market_data_obs[:, self._flip_idx] *= -1.0
+
+        # ----------------  return dict observation -------------------
         return {
             "market_data": market_data_obs,
             "position": self.current_position
@@ -150,11 +179,15 @@ class BitcoinTradingEnv(gym.Env):
             earliest_possible_idx, latest_possible_idx + 1
         )
         
+        #print(f"possible_idx: {earliest_possible_idx} ~ {latest_possible_idx}")
+        # if mode == 'train':
+        #     self.flip_sign = self.np_random.random() < 0.5
+
         obs = self._get_obs()
         info = { "action_taken_description": f"Reset to mode '{mode}'" }
         return obs, info
 
-    def step(self, action):
+    def step(self, action, mode='train'):
         if self.terminated:
             raise RuntimeError("환경이 종료되었습니다. reset()을 호출하여 새 에피소드를 시작하세요.")
 
@@ -189,6 +222,15 @@ class BitcoinTradingEnv(gym.Env):
             # Short 포지션 손실이 100% (가격 2배 상승) 이상일 경우 log 인자가 0 이하가 될 수 있음
             reward += np.log(max(1e-9, arg_for_short_log))
         
+        # if mode == 'train':
+        #     reward = reward - np.log(price_ratio)  
+        #     if previous_position == 1:        # flat/ cash
+        #         reward -= 2e-4    
+        #     elif previous_position == 2: # Long 포지션이었다면
+        #         reward -= 4e-4
+        # else:
+        #     reward = reward  
+
         self.terminated = self.steps_this_episode >= self.episode_length
         
         obs = self._get_obs()
@@ -196,7 +238,10 @@ class BitcoinTradingEnv(gym.Env):
 
         if self.render_mode == 'human':
             self.render()
-            
+
+        if self.flip_sign:
+            reward = -reward    
+        
         return obs, reward, self.terminated, info
 
     def render(self):
@@ -256,15 +301,15 @@ class BitcoinTradingEnv(gym.Env):
         self.df['VWAP'] = (volume * (high + low + close) / 3).cumsum() / volume.cumsum()
         
         # Normalize indicators to similar scales
-        def normalize(series):
-            return (series - series.rolling(window=100, min_periods=1).mean()) / \
-                   (series.rolling(window=100, min_periods=1).std() + 1e-8)
+        # def normalize(series):
+        #     return (series - series.rolling(window=100, min_periods=1).mean()) / \
+        #            (series.rolling(window=100, min_periods=1).std() + 1e-8)
         
         indicators = ['RSI', 'MACD', 'BB_Position', 'ATR', 'OBV', 
                      'ADX', 'Stoch_D', 'CCI', 'MFI', 'VWAP']
         
-        for ind in indicators:
-            self.df[ind] = normalize(self.df[ind])
+        # for ind in indicators:
+        #     self.df[ind] = normalize(self.df[ind])
             
         # Handle NaN values
         self.df = self.df.fillna(method='bfill').fillna(0)
