@@ -18,8 +18,6 @@ from torch.distributions import Categorical
 import argparse
 from typing import Tuple, List
 from tqdm import tqdm
-import matplotlib
-matplotlib.use('Agg')  # Set the backend before importing pyplot
 import matplotlib.pyplot as plt
 from src.environment import BitcoinTradingEnv
 
@@ -399,6 +397,7 @@ class RolloutBuffer:
         self.values = []
         self.log_probs = []
         self.dones = []
+        self.traj_returns = []  # Store episode returns for CVaR
         
     def clear(self):
         self.__init__()
@@ -436,10 +435,17 @@ def train_ppo(
     actor_critic.to(device)
     optimizer = optim.Adam(actor_critic.parameters(), lr=5e-5)
     
+    # CVaR hyperparameters
+    alpha = 0.1  # tail fraction
+    lr_lambda = 1e-3
+    eta = 0.0  # CVaR threshold
+    cvar_lambda = 0.0  # Lagrange multiplier
+    gamma = 0.99  # discount factor
+    
     # Loss coefficients
-    value_coef = 0.5       # c1 in PPO paper
-    entropy_coef = 0.005    # c2 in PPO paper
-    imitation_coef = beta  # Bollinger imitation weight
+    value_coef = 0.5
+    entropy_coef = 0.005
+    imitation_coef = beta
     
     # Training loop variables
     step_count = 0
@@ -447,28 +453,25 @@ def train_ppo(
     best_mean_reward = float("-inf")
     no_improvement_count = 0
     
-    # Progress bar setup
     pbar = tqdm(total=total_steps, desc='Training')
-    
     buffer = RolloutBuffer()
     
     while step_count < total_steps:
         state, _ = env.reset()
         episode_reward = 0
+        disc_return = 0
+        gamma_pow = 1.0
         done = False
         
         while not done:
-            # Convert state dict to tensors
             market_data = torch.FloatTensor(state["market_data"]).unsqueeze(0).to(device)
             position = torch.LongTensor([state["position"]]).to(device)
             
-            # Get action from policy
             with torch.no_grad():
                 dist, value = actor_critic(market_data, position)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
             
-            # Take step in environment
             next_state, reward, done, info = env.step(action.item())
             
             # Store transition
@@ -479,37 +482,43 @@ def train_ppo(
             buffer.log_probs.append(log_prob.item())
             buffer.dones.append(done)
             
+            # Track discounted return
+            disc_return += gamma_pow * reward
+            gamma_pow *= gamma
+            
             state = next_state
             episode_reward += reward
             step_count += 1
 
-            # Update progress bar
             pbar.update(1)
             pbar.set_postfix({
                 'reward': f'{np.exp(episode_reward):.5f}',
                 'episode': len(episode_rewards)
             })
             
-            # Update if episode ends or buffer is full
             if done or len(buffer.states) >= 2048:
-                # Get final value estimate
+                if done:
+                    buffer.traj_returns.append(disc_return)
+                
                 with torch.no_grad():
                     _, last_value = actor_critic(
                         torch.FloatTensor(state["market_data"]).unsqueeze(0).to(device),
                         torch.LongTensor([state["position"]]).to(device)
                     )
                 
-                # Compute returns and advantages
                 returns, advantages = buffer.compute_returns_and_advantages(
                     last_value.item(), gamma=0.99, gae_lambda=0.95
                 )
                 
-                # normalize the advantage
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-                # send to device
                 returns = returns.to(device)
                 advantages = advantages.to(device)
+
+                # Update CVaR parameters
+                if len(buffer.traj_returns) > 0:
+                    eta = float(np.quantile(buffer.traj_returns, alpha))
+                    pos_part = np.maximum(0, eta - np.array(buffer.traj_returns))
+                    cvar_lambda += lr_lambda * (np.mean(pos_part)/(1-alpha) + beta - eta)
 
                 # Convert buffer data to tensors
                 market_data = torch.FloatTensor(
@@ -521,38 +530,42 @@ def train_ppo(
                 actions = torch.LongTensor(buffer.actions).to(device)
                 old_log_probs = torch.FloatTensor(buffer.log_probs).to(device)
                 
-                # PPO update (multiple epochs)
+                # Create tensor of discounted returns for each transition
+                batch_disc_returns = torch.FloatTensor([
+                    buffer.traj_returns[i] for i in range(len(buffer.traj_returns))
+                    for _ in range(len(buffer.states) // len(buffer.traj_returns))
+                ]).to(device)
+                
                 for _ in range(10):
-                    # Generate mini-batches
                     indices = np.random.permutation(len(buffer.states))
                     for start_idx in range(0, len(buffer.states), 128):
                         batch_indices = indices[start_idx:start_idx + 128]
                         
-                        # Get batch data
                         batch_market_data = market_data[batch_indices]
                         batch_positions = positions[batch_indices]
                         batch_actions = actions[batch_indices]
                         batch_advantages = advantages[batch_indices]
                         batch_returns = returns[batch_indices]
                         batch_old_log_probs = old_log_probs[batch_indices]
+                        batch_disc_rets = batch_disc_returns[batch_indices]
                         
-                        # Forward pass
                         dist, value = actor_critic(batch_market_data, batch_positions)
                         new_log_probs = dist.log_prob(batch_actions)
-                        
-                        # Entropy bonus
                         entropy = dist.entropy().mean()
                         
-                        # PPO surrogate losses
-                        ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                        surr1 = ratio * batch_advantages
-                        surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * batch_advantages
-                        policy_loss = -torch.min(surr1, surr2).mean()
+                        # CVaR-adjusted advantage
+                        adv_cvar = batch_advantages - (cvar_lambda/(1-alpha)) * torch.clamp(
+                            -(batch_disc_rets - eta), min=0.0
+                        )
                         
-                        # Value function loss
+                        ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                        policy_loss = -torch.min(
+                            ratio * adv_cvar,
+                            torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * adv_cvar
+                        ).mean()
+                        
                         value_loss = nn.functional.mse_loss(value.squeeze(), batch_returns)
                         
-                        # KL regularization with reference policy
                         batch_states = [buffer.states[i] for i in batch_indices]
                         ref_probs = torch.FloatTensor(
                             np.array([ref_policy.action_prob(s) for s in batch_states])
@@ -560,37 +573,31 @@ def train_ppo(
                         kl_div = (ref_probs * torch.log(ref_probs / torch.softmax(dist.logits, dim=-1))).sum(-1)
                         imitation_loss = kl_div.mean()
                         
-                        # Compute total loss
                         total_loss = (
                             policy_loss
                             + value_coef * value_loss
-                            - entropy_coef * entropy  # Note minus sign: maximize entropy
+                            - entropy_coef * entropy
                             + imitation_coef * imitation_loss
                         )
                         
-                        # Single backward pass and optimization step
                         optimizer.zero_grad()
                         total_loss.backward()
                         torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), max_norm=1)
                         optimizer.step()
                         
-                        # Optional: log different loss components
-                        # if step_count % 1000 == 0:
-                        #     print(f"\nLoss components:")
-                        #     print(f"Policy loss: {policy_loss.item():.6f}")
-                        #     print(f"Value loss: {value_loss.item():.6f}")
-                        #     print(f"Entropy: {entropy.item():.6f}")
-                        #     print(f"Imitation loss: {imitation_loss.item():.6f}")
-                        #     print(f"Total loss: {total_loss.item():.6f}")
-                        #     print('value_loss', value_loss.item(),
-                        #             'adv mean', batch_advantages.mean().item(),
-                        #             'adv sig',  batch_advantages.std().item())
+                # Log CVaR estimate
+                if len(buffer.traj_returns) > 0:
+                    curr_cvar = eta + np.mean(np.maximum(0, eta - np.array(buffer.traj_returns)))/(1-alpha)
+                    pbar.set_postfix({
+                        'CVaR': f'{curr_cvar:.3f}',
+                        'eta': f'{eta:.3f}',
+                        'lambda': f'{cvar_lambda:.3f}'
+                    })
                 
                 buffer.clear()
         
         episode_rewards.append(episode_reward)
         
-        # Display episode summary
         if len(episode_rewards) % 10 == 0:
             mean_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
             print(f"\nEpisode {len(episode_rewards)}")
@@ -599,15 +606,7 @@ def train_ppo(
             print(f"Min reward: {np.exp(min(episode_rewards[-100:])):.3f}")
             print("sign", env.flip_sign)
         
-
-        # if abs(np.mean(episode_rewards[-10:])) < 0.0001:
-        #     "reward is 0, change beta"
-        #     imitation_coef = 0.01
-        #     #print(f"Reward has been 0 for 10 episodes, change beta to {imitation_coef}")
-
-        # Early stopping check
         if len(episode_rewards) >= 10:
-            #breakpoint()
             mean_reward = np.mean(episode_rewards[-1])
 
             if mean_reward > best_mean_reward:
@@ -623,18 +622,7 @@ def train_ppo(
                 break
     
     pbar.close()
-    
-    # # Plot training curve
-    # plt.figure(figsize=(10, 6))
-    # plt.plot(episode_rewards)
-    # plt.xlabel('Episode')
-    # plt.ylabel('Return')
-    # plt.title('Training Performance')
-    # plt.grid(True)
-    # plt.savefig('training_curve.png')
-    # plt.close()
-    
-    # return episode_rewards
+    return episode_rewards
 
 def evaluate(env: BitcoinTradingEnv, actor_critic: ActorCritic, n_episodes: int = 100, mode: str = 'test') -> float:
     device = next(actor_critic.parameters()).device
@@ -654,7 +642,7 @@ def evaluate(env: BitcoinTradingEnv, actor_critic: ActorCritic, n_episodes: int 
             
             with torch.no_grad():
                 dist, _ = actor_critic(market_data, position)
-                action = dist.sample() #dist.logits.argmax(dim=-1) #dist.sample()
+                action = dist.logits.argmax(dim=-1) #dist.sample() #dist.logits.argmax(dim=-1) #dist.sample() #
             
             state, reward, done, _ = env.step(action.item(), mode=mode)
             episode_reward += reward
@@ -683,7 +671,7 @@ if __name__ == "__main__":
     env = BitcoinTradingEnv(
         csv_path=args.data_path,
         window_size=168,  # 7 days * 24 hours
-        episode_length=13000,
+        episode_length=26000,
         date_ranges_by_mode=date_ranges
     )
     
@@ -691,16 +679,15 @@ if __name__ == "__main__":
     input_shape = env.observation_space["market_data"].shape
     n_actions = env.action_space.n
     
-    actor_critic = ActorCritic(input_shape, n_actions)
-
+    actor_critic = ActorCritic_tcn(input_shape, n_actions)
     #ref_policy = BollingerPolicy()
     ref_policy = OracleLookaheadPolicy(env)
 
     # Train
-    #rewards = train_ppo(env, actor_critic, ref_policy, args.total_steps, args.beta)
+    rewards = train_ppo(env, actor_critic, ref_policy, args.total_steps, args.beta)
     
     # Final evaluation
-    actor_critic.load_state_dict(torch.load("best_model_2.184_normalbest.pt"))
+    actor_critic.load_state_dict(torch.load("best_model_505.673.pt"))
     # test_reward, test_rewards = evaluate(env, actor_critic, mode='val')
     # print(f"\nTest set evaluation mean reward: {np.exp(test_reward):.3f}") 
     # print(f"Test set rewards: {[np.exp(r) for r in test_rewards]}")
@@ -726,40 +713,18 @@ if __name__ == "__main__":
     env_test = BitcoinTradingEnv(
         csv_path=args.data_path,
         window_size=168,  # 7 days * 24 hours
-        episode_length=1870,
+        episode_length=18700,
         date_ranges_by_mode=test_data_ranges
     )
     
 
-    test_reward, test_rewards, test_actions = evaluate(env_test, actor_critic, n_episodes=2, mode='test')
+    test_reward, test_rewards, test_actions = evaluate(env_test, actor_critic, n_episodes=3, mode='test')
     print(f"\nTest set evaluation mean reward: {np.exp(test_reward):.3f}") 
     print(f"Test set rewards: {[np.exp(r[0]) for r in test_rewards]}")
     #print(f"Test set reward changes: {[r[1] for r in test_rewards]}")
 
-    price_total = [r[1] for r in test_rewards]
-    
-    # Create new figure with Agg backend
-    fig = plt.figure(figsize=(15, 7))
-    ax = fig.add_subplot(111)
-    
-    for episode_idx, episode_returns in enumerate(price_total):
-        episode_returns = np.array(episode_returns, dtype=np.float64)
-        actual_returns = np.exp(episode_returns) - 1
-        cumulative_pnl = np.cumprod(1 + actual_returns) - 1
-        
-        # Simple plotting
-        ax.plot(cumulative_pnl, label=f'Episode {episode_idx + 1}')
-    
-    ax.set_title('Cumulative PnL Over Time')
-    ax.set_xlabel('Trading Step')
-    ax.set_ylabel('Cumulative Return (%)')
-    ax.grid(True)
-    ax.legend()
-    
-    # Save and close
-    fig.savefig('cumulative_pnl.png', dpi=300, bbox_inches='tight')
-    plt.close(fig)
-    
+    #print(test_actions)
+
     # action statistics
     action_stats = {}
     for action in test_actions[0]:

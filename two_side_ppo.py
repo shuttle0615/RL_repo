@@ -18,8 +18,6 @@ from torch.distributions import Categorical
 import argparse
 from typing import Tuple, List
 from tqdm import tqdm
-import matplotlib
-matplotlib.use('Agg')  # Set the backend before importing pyplot
 import matplotlib.pyplot as plt
 from src.environment import BitcoinTradingEnv
 
@@ -430,6 +428,7 @@ def train_ppo(
     ref_policy: BollingerPolicy,
     total_steps: int,
     beta: float,
+    is_long: bool,
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 ) -> List[float]:
     # Initialize with single optimizer
@@ -468,8 +467,15 @@ def train_ppo(
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
             
+            if is_long:
+                # Map [0,1] to [1,2] (flat/long)
+                env_action = action.item() + 1
+            else:
+                # Map [0,1] to [0,1] (short/flat)
+                env_action = action.item()
+
             # Take step in environment
-            next_state, reward, done, info = env.step(action.item())
+            next_state, reward, done, info = env.step(env_action)
             
             # Store transition
             buffer.states.append(state)
@@ -552,20 +558,20 @@ def train_ppo(
                         # Value function loss
                         value_loss = nn.functional.mse_loss(value.squeeze(), batch_returns)
                         
-                        # KL regularization with reference policy
-                        batch_states = [buffer.states[i] for i in batch_indices]
-                        ref_probs = torch.FloatTensor(
-                            np.array([ref_policy.action_prob(s) for s in batch_states])
-                        ).to(device)
-                        kl_div = (ref_probs * torch.log(ref_probs / torch.softmax(dist.logits, dim=-1))).sum(-1)
-                        imitation_loss = kl_div.mean()
+                        # # KL regularization with reference policy
+                        # batch_states = [buffer.states[i] for i in batch_indices]
+                        # ref_probs = torch.FloatTensor(
+                        #     np.array([ref_policy.action_prob(s) for s in batch_states])
+                        # ).to(device)
+                        # kl_div = (ref_probs * torch.log(ref_probs / torch.softmax(dist.logits, dim=-1))).sum(-1)
+                        # imitation_loss = kl_div.mean()
                         
                         # Compute total loss
                         total_loss = (
                             policy_loss
                             + value_coef * value_loss
                             - entropy_coef * entropy  # Note minus sign: maximize entropy
-                            + imitation_coef * imitation_loss
+                            # + imitation_coef * imitation_loss
                         )
                         
                         # Single backward pass and optimization step
@@ -612,13 +618,13 @@ def train_ppo(
 
             if mean_reward > best_mean_reward:
                 best_mean_reward = mean_reward
-                torch.save(actor_critic.state_dict(), f"best_model_{np.exp(best_mean_reward):.3f}.pt")
+                torch.save(actor_critic.state_dict(), f"best_model_{np.exp(best_mean_reward):.3f}_{'long' if is_long else 'short'}.pt")
                 print(f"Best mean reward: {best_mean_reward:.3f} - model saved")
                 no_improvement_count = 0
             else:
                 no_improvement_count += 1
                 
-            if no_improvement_count >= 400:
+            if no_improvement_count >= 20:
                 print(f"Early stopping at step {step_count}")
                 break
     
@@ -636,8 +642,14 @@ def train_ppo(
     
     # return episode_rewards
 
-def evaluate(env: BitcoinTradingEnv, actor_critic: ActorCritic, n_episodes: int = 100, mode: str = 'test') -> float:
-    device = next(actor_critic.parameters()).device
+def evaluate_combined(
+    env: BitcoinTradingEnv,
+    long_model: ActorCritic,
+    short_model: ActorCritic,
+    n_episodes: int = 100,
+    mode: str = 'test'
+) -> float:
+    device = next(long_model.parameters()).device
     rewards = []
     actions = []
     
@@ -652,14 +664,31 @@ def evaluate(env: BitcoinTradingEnv, actor_critic: ActorCritic, n_episodes: int 
             market_data = torch.FloatTensor(state["market_data"]).unsqueeze(0).to(device)
             position = torch.LongTensor([state["position"]]).to(device)
             
+            # Get predictions from both models
             with torch.no_grad():
-                dist, _ = actor_critic(market_data, position)
-                action = dist.sample() #dist.logits.argmax(dim=-1) #dist.sample()
+                # Long model predicts between flat (0) and long (1)
+                long_dist, _ = long_model(market_data, position)
+                long_action = long_dist.sample().item() #long_dist.logits.argmax(dim=-1).item()
+                
+                # Short model predicts between short (0) and flat (1)
+                short_dist, _ = short_model(market_data, position)
+                short_action = short_dist.sample().item() #short_dist.logits.argmax(dim=-1).item()
+                
+                # Combine predictions:
+                # If long model says long (1) and short model says flat (1) -> go long (2)
+                # If long model says flat (0) and short model says short (0) -> go short (0)
+                # Otherwise -> stay flat (1)
+                final_action = 1  # default to flat
+                if long_action == 1 and short_action == 1:
+                    final_action = 2  # go long
+                elif long_action == 0 and short_action == 0:
+                    final_action = 0  # go short
             
-            state, reward, done, _ = env.step(action.item(), mode=mode)
+            state, reward, done, _ = env.step(final_action, mode=mode)
             episode_reward += reward
-            action_list.append(action.item())
+            action_list.append(final_action)
             reward_list.append(reward)
+        
         rewards.append((episode_reward, reward_list))
         actions.append(action_list)
 
@@ -689,35 +718,24 @@ if __name__ == "__main__":
     
     # Initialize models
     input_shape = env.observation_space["market_data"].shape
-    n_actions = env.action_space.n
     
-    actor_critic = ActorCritic(input_shape, n_actions)
-
-    #ref_policy = BollingerPolicy()
+    # Long-only model (2 actions: flat or long)
+    long_model = ActorCritic(input_shape, n_actions=2)
+    
+    # Short-only model (2 actions: short or flat)
+    short_model = ActorCritic(input_shape, n_actions=2)
+    
+    # Initialize reference policy
     ref_policy = OracleLookaheadPolicy(env)
 
-    # Train
-    #rewards = train_ppo(env, actor_critic, ref_policy, args.total_steps, args.beta)
+    # Train both models separately
+    # print("Training long-only model...")
+    # long_rewards = train_ppo(env, long_model, ref_policy, args.total_steps, beta=args.beta, is_long=True)
     
-    # Final evaluation
-    actor_critic.load_state_dict(torch.load("best_model_2.184_normalbest.pt"))
-    # test_reward, test_rewards = evaluate(env, actor_critic, mode='val')
-    # print(f"\nTest set evaluation mean reward: {np.exp(test_reward):.3f}") 
-    # print(f"Test set rewards: {[np.exp(r) for r in test_rewards]}")
-
-    # evaluate the entire test set 
-    # test_data_ranges = {
-    #     'train': ('2019-09-01', '2022-12-31'),
-    #     'val': ('2023-01-01', '2023-06-30'),
-    #     'test': ('2025-01-01', '2025-04-01')
-    # }
-    # env_test = BitcoinTradingEnv(
-    #     csv_path=args.data_path,
-    #     window_size=168,  # 7 days * 24 hours
-    #     episode_length=2100,
-    #     date_ranges_by_mode=test_data_ranges
-    # )
+    # print("\nTraining short-only model...")
+    # short_rewards = train_ppo(env, short_model, ref_policy, args.total_steps, beta=args.beta, is_long=False)
     
+    # Test data setup
     test_data_ranges = {
         'train': ('2020-01-01', '2022-12-31'),
         'val': ('2023-01-01', '2023-02-01'),
@@ -726,45 +744,25 @@ if __name__ == "__main__":
     env_test = BitcoinTradingEnv(
         csv_path=args.data_path,
         window_size=168,  # 7 days * 24 hours
-        episode_length=1870,
+        episode_length=18700,
         date_ranges_by_mode=test_data_ranges
     )
     
+    long_model.load_state_dict(torch.load("best_model_4.573_long.pt"))
+    short_model.load_state_dict(torch.load("best_model_1.057_short.pt"))
 
-    test_reward, test_rewards, test_actions = evaluate(env_test, actor_critic, n_episodes=2, mode='test')
+    # Evaluate combined strategy
+    test_reward, test_rewards, test_actions = evaluate_combined(
+        env_test, long_model, short_model, n_episodes=1, mode='test'
+    )
     print(f"\nTest set evaluation mean reward: {np.exp(test_reward):.3f}") 
     print(f"Test set rewards: {[np.exp(r[0]) for r in test_rewards]}")
-    #print(f"Test set reward changes: {[r[1] for r in test_rewards]}")
 
-    price_total = [r[1] for r in test_rewards]
-    
-    # Create new figure with Agg backend
-    fig = plt.figure(figsize=(15, 7))
-    ax = fig.add_subplot(111)
-    
-    for episode_idx, episode_returns in enumerate(price_total):
-        episode_returns = np.array(episode_returns, dtype=np.float64)
-        actual_returns = np.exp(episode_returns) - 1
-        cumulative_pnl = np.cumprod(1 + actual_returns) - 1
-        
-        # Simple plotting
-        ax.plot(cumulative_pnl, label=f'Episode {episode_idx + 1}')
-    
-    ax.set_title('Cumulative PnL Over Time')
-    ax.set_xlabel('Trading Step')
-    ax.set_ylabel('Cumulative Return (%)')
-    ax.grid(True)
-    ax.legend()
-    
-    # Save and close
-    fig.savefig('cumulative_pnl.png', dpi=300, bbox_inches='tight')
-    plt.close(fig)
-    
-    # action statistics
+    # Action statistics
     action_stats = {}
     for action in test_actions[0]:
         if action not in action_stats:
             action_stats[action] = 0
         action_stats[action] += 1
-    print(action_stats)
+    print(f"Action statistics: {action_stats}")
     

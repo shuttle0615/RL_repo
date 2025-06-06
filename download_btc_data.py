@@ -184,6 +184,6 @@ if __name__ == "__main__":
     # Example usage
     fetch_ohlcv_data(
         symbol='BTC/USDT',
-        timeframe='1h',
+        timeframe='15md',
         save_path='data'
     ) 
